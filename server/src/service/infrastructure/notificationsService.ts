@@ -133,13 +133,68 @@ export class NotificationsService implements INotificationsService {
 	};
 
 	handleNotifications = async (monitor: Monitor, monitorStatusResponse: MonitorStatusResponse, decision: MonitorActionDecision) => {
-		if (!decision.shouldSendNotification) {
-			return false;
-		}
+    if (!decision.shouldSendNotification) {
+        return false;
+    }
 
-		// Send notifications based on decision
-		return await this.sendNotifications(monitor, monitorStatusResponse, decision);
-	};
+    // Send regular notifications
+    await this.sendNotifications(monitor, monitorStatusResponse, decision);
+
+    // Handle escalation: if monitor is still down and has escalation configured
+    if (
+        monitor.status === "down" &&
+        monitor.escalationDelay > 0 &&
+        monitor.escalationNotifications &&
+        monitor.escalationNotifications.length > 0
+    ) {
+        const updatedAt = new Date(monitor.updatedAt).getTime();
+        const downtimeMs = Date.now() - updatedAt;
+        const delayMs = monitor.escalationDelay * 60 * 1000;
+
+        if (downtimeMs >= delayMs) {
+            await this.sendEscalationNotifications(monitor, monitorStatusResponse, decision);
+        }
+    }
+
+    return true;
+};
+
+private sendEscalationNotifications = async (monitor: Monitor, monitorStatusResponse: MonitorStatusResponse, decision: MonitorActionDecision) => {
+    const escalationIds = monitor.escalationNotifications ?? [];
+    const notifications = await this.notificationsRepository.findNotificationsByIds(escalationIds);
+
+    const settings = this.settingsService.getSettings();
+    const clientHost = settings.clientHost || "Host not defined";
+
+    // Build a custom escalation message
+    const escalationMessage = {
+        type: "monitor_down" as const,
+        severity: "critical" as const,
+        monitor: {
+            id: monitor.id,
+            name: monitor.name,
+            url: monitor.url,
+            type: monitor.type,
+            status: monitor.status,
+        },
+        content: {
+            title: `Escalation: Monitor ${monitor.name} is still down`,
+            summary: `Monitor "${monitor.name}" has been down for more than ${monitor.escalationDelay} minute(s) and requires immediate attention.`,
+            details: [`URL: ${monitor.url}`, `Status: Still Down`, `Escalation delay: ${monitor.escalationDelay} minute(s)`],
+            timestamp: new Date(),
+        },
+        clientHost,
+        metadata: {
+            teamId: monitor.teamId,
+            notificationReason: "status_change",
+        },
+    };
+
+    const tasks = notifications.map((notification) =>
+        this.send(notification, monitor, monitorStatusResponse, decision, escalationMessage)
+    );
+    await Promise.all(tasks);
+};
 
 	sendTestNotification = async (notification: Partial<Notification>) => {
 		switch (notification.type) {
